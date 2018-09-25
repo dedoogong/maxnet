@@ -1,0 +1,194 @@
+#include "convolutional_cudnn_layer.h"
+#include "utils.h"
+#include "batchnorm_cudnn_layer.h"
+#include "activation_gpu_layer.h"
+#include "im2col.h"
+#include "col2im.h"
+#include "blas.h"
+#include "gemm.h"
+#include "cuda.h"
+#include <stdio.h>
+#include <time.h>
+
+size_t get_workspace_size_cudnn(layer l){
+
+    if(gpu_index >= 0){
+        size_t most = 0;
+        size_t s = 0;
+        cudnnGetConvolutionForwardWorkspaceSize(cudnn_handle(),
+                l.srcTensorDesc,
+                l.weightDesc,
+                l.convDesc,
+                l.dstTensorDesc,
+                l.fw_algo,
+                &s);
+        if (s > most) most = s;
+        cudnnGetConvolutionBackwardFilterWorkspaceSize(cudnn_handle(),
+                l.srcTensorDesc,
+                l.dDstTensorDesc,
+                l.convDesc,
+                l.dweightDesc,
+                l.bf_algo,
+                &s);
+        if (s > most) most = s;
+        cudnnGetConvolutionBackwardDataWorkspaceSize(cudnn_handle(),
+                l.weightDesc,
+                l.dDstTensorDesc,
+                l.convDesc,
+                l.dSrcTensorDesc,
+                l.bd_algo,
+                &s);
+        if (s > most) most = s;
+        return most;
+    }
+}
+
+
+void cudnn_convolutional_setup(convolutional_layer *l)
+{
+
+    cudnnSetTensor4dDescriptor(l->dSrcTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, l->batch, l->c, l->h, l->w); 
+    cudnnSetTensor4dDescriptor(l->dDstTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, l->batch, l->out_c, l->out_h, l->out_w); 
+
+    cudnnSetTensor4dDescriptor(l->srcTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, l->batch, l->c, l->h, l->w); 
+    cudnnSetTensor4dDescriptor(l->dstTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, l->batch, l->out_c, l->out_h, l->out_w); 
+    cudnnSetTensor4dDescriptor(l->normTensorDesc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, l->out_c, 1, 1); 
+    cudnnSetFilter4dDescriptor(l->dweightDesc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, l->n, l->c/l->groups, l->size, l->size); 
+    cudnnSetFilter4dDescriptor(l->weightDesc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, l->n, l->c/l->groups, l->size, l->size);  
+    #if CUDNN_MAJOR >= 6
+    cudnnSetConvolution2dDescriptor(l->convDesc, l->pad, l->pad, l->stride, l->stride, 1, 1, CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT);
+    #else
+    cudnnSetConvolution2dDescriptor(l->convDesc, l->pad, l->pad, l->stride, l->stride, 1, 1, CUDNN_CROSS_CORRELATION);
+    #endif
+
+    #if CUDNN_MAJOR >= 7
+    cudnnSetConvolutionGroupCount(l->convDesc, l->groups);
+    #else
+    if(l->groups > 1){
+        error("CUDNN < 7 doesn't support groups, please upgrade!");
+    }
+    #endif
+
+    cudnnGetConvolutionForwardAlgorithm(cudnn_handle(),
+            l->srcTensorDesc,
+            l->weightDesc,
+            l->convDesc,
+            l->dstTensorDesc,
+            CUDNN_CONVOLUTION_FWD_SPECIFY_WORKSPACE_LIMIT,
+            2000000000,
+            &l->fw_algo);
+    cudnnGetConvolutionBackwardDataAlgorithm(cudnn_handle(),
+            l->weightDesc,
+            l->dDstTensorDesc,
+            l->convDesc,
+            l->dSrcTensorDesc,
+            CUDNN_CONVOLUTION_BWD_DATA_SPECIFY_WORKSPACE_LIMIT,
+            2000000000,
+            &l->bd_algo);
+    cudnnGetConvolutionBackwardFilterAlgorithm(cudnn_handle(),
+            l->srcTensorDesc,
+            l->dDstTensorDesc,
+            l->convDesc,
+            l->dweightDesc,
+            CUDNN_CONVOLUTION_BWD_FILTER_SPECIFY_WORKSPACE_LIMIT,
+            2000000000,
+            &l->bf_algo);
+}
+
+void make_convolutional_layer_cudnn(convolutional_layer *l)
+{
+		  l->forward_cudnn  = forward_convolutional_layer_cudnn;
+		  l->backward_cudnn = backward_convolutional_layer_cudnn;  
+      cudnnCreateTensorDescriptor(&l->normTensorDesc);
+      cudnnCreateTensorDescriptor(&l->srcTensorDesc);
+      cudnnCreateTensorDescriptor(&l->dstTensorDesc);
+      cudnnCreateFilterDescriptor(&l->weightDesc);
+      cudnnCreateTensorDescriptor(&l->dSrcTensorDesc);
+      cudnnCreateTensorDescriptor(&l->dDstTensorDesc);
+      cudnnCreateFilterDescriptor(&l->dweightDesc);
+      cudnnCreateConvolutionDescriptor(&l->convDesc);
+      cudnn_convolutional_setup(l); 
+
+} 
+
+void resize_convolutional_layer_cudnn(convolutional_layer *l)
+{
+    cudnn_convolutional_setup(l);
+} 
+ 
+void forward_convolutional_layer_cudnn(convolutional_layer l, network net)
+{
+    float one = 1;
+    cudnnConvolutionForward(cudnn_handle(),
+                            &one,
+                            l.srcTensorDesc,
+                            net.input_gpu,
+                            l.weightDesc,
+                            l.weights_gpu,
+                            l.convDesc,
+                            l.fw_algo,
+                            net.workspace,
+                            l.workspace_size,
+                            &one,
+                            l.dstTensorDesc,
+                            l.output_gpu);
+    if (l.batch_normalize) {
+        forward_batchnorm_layer_cudnn(l, net);
+    } else {
+        add_bias_gpu(l.output_gpu, l.biases_gpu, l.batch, l.n, l.out_w*l.out_h);
+    }
+
+    activate_array_gpu(l.output_gpu, l.outputs*l.batch, l.activation);
+}
+
+void backward_convolutional_layer_cudnn(convolutional_layer l, network net){
+    if(l.smooth){
+        smooth_layer(l, 5, l.smooth);
+    }
+    //constrain_gpu(l.outputs*l.batch, 1, l.delta_gpu, 1);
+    gradient_array_gpu(l.output_gpu, l.outputs*l.batch, l.activation, l.delta_gpu);
+
+
+    if(l.batch_normalize){
+        backward_batchnorm_layer_gpu(l, net);
+    } else {
+        backward_bias_gpu(l.bias_updates_gpu, l.delta_gpu, l.batch, l.n, l.out_w*l.out_h);
+    }
+    float *original_input = net.input_gpu;
+
+    if(l.xnor) net.input_gpu = l.binary_input_gpu;
+
+    float one = 1;
+    cudnnConvolutionBackwardFilter(cudnn_handle(),
+            &one,
+            l.srcTensorDesc,
+            net.input_gpu,
+            l.dDstTensorDesc,
+            l.delta_gpu,
+            l.convDesc,
+            l.bf_algo,
+            net.workspace,
+            l.workspace_size,
+            &one,
+            l.dweightDesc,
+            l.weight_updates_gpu);
+
+    if(net.delta_gpu){ 
+        cudnnConvolutionBackwardData(cudnn_handle(),
+                &one,
+                l.weightDesc,
+                l.weights_gpu,
+                l.dDstTensorDesc, //	const cudnnTensorDescriptor_t       dyDesc,
+                l.delta_gpu,			//  const void                         *dy,
+                l.convDesc,				//
+                l.bd_algo,				//
+                net.workspace,		//
+                l.workspace_size,	//
+                &one,							//
+                l.dSrcTensorDesc,	//	const cudnnTensorDescriptor_t       dxDesc,
+                net.delta_gpu); 	//	void                               *dx
+    }
+}
+
+
+
