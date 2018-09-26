@@ -1,5 +1,5 @@
 # maxnet
-light version of 
+light version of darknet
 
 make -j16
 
